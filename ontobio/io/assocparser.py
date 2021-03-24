@@ -34,6 +34,8 @@ ENTITY = 'ENTITY'
 ANNOTATION = 'ANNOTATION'
 EXTENSION = 'EXTENSION'
 
+logger = logging.getLogger(__name__)
+
 
 def write_to_file(optional_file, text):
     if optional_file:
@@ -70,11 +72,14 @@ class AssocParserConfig():
                  filtered_evidence_file=None,
                  gpi_authority_path=None,
                  paint=False,
-                 rule_metadata=None,
+                 rule_metadata=dict(),
                  goref_metadata=None,
+                 group_metadata=None,
                  dbxrefs=None,
                  suppress_rule_reporting_tags=[],
-                 annotation_inferences=None):
+                 annotation_inferences=None,
+                 extensions_constraints=None,
+                 rule_contexts=[]):
 
         self.remove_double_prefixes=remove_double_prefixes
         self.ontology=ontology
@@ -91,10 +96,13 @@ class AssocParserConfig():
         self.paint = paint
         self.rule_metadata = rule_metadata
         self.goref_metadata = goref_metadata
+        self.group_metadata = group_metadata
         self.suppress_rule_reporting_tags = suppress_rule_reporting_tags
         self.annotation_inferences = annotation_inferences
         self.entity_idspaces = entity_idspaces
+        self.extensions_constraints = AssocParserConfig._compute_constraint_subclasses(extensions_constraints, ontology)
         self.group_idspace = None if group_idspace is None else set(group_idspace)
+        self.rule_contexts = rule_contexts
         # This is a dictionary from ruleid: `gorule-0000001` to title strings
         if self.exclude_relations is None:
             self.exclude_relations = []
@@ -103,11 +111,36 @@ class AssocParserConfig():
         if self.filter_out_evidence is None:
             self.filter_out_evidence = []
 
+
+    def _compute_constraint_subclasses(extensions_constraints, ontology):
+        if extensions_constraints is None:
+            return None
+        # Precompute subclass closures in the extensions_constraints
+        cache = dict()  # term -> [children]
+        for constraint in extensions_constraints:
+            terms = set()
+            for term in constraint["primary_root_terms"]:
+                if not term in cache and ontology is not None:
+                    cache[term] = ontology.descendants(term, relations=["subClassOf"], reflexive=True)
+                elif ontology is None:
+                    cache[term] = [term]
+
+                terms.update(cache[term])
+
+            constraint["primary_terms"] = sorted(list(terms))
+
+        return extensions_constraints
+
     def __eq__(self, other):
         if isinstance(other, self.__class__):
             return self.__dict__ == other.__dict__
         else:
             return False
+
+    def __str__(self):
+        s = "AssocParserConfig("
+        attribute_values = ["{att}={val}".format(att=att, val=dict([(k, v) for k, v in value.items()][:8]) if isinstance(value, dict) else value) for att, value in vars(self).items()]
+        return "AssocParserConfig({})".format(",".join(attribute_values))
 
 
 class Report(object):
@@ -142,6 +175,7 @@ class Report(object):
     EXTENSION_SYNTAX_ERROR = "Syntax error in annotation extension field"
     VIOLATES_GO_RULE = "Violates GO Rule"
     RULE_PASS = "Passes GO Rule"
+    INVALID_REFERENCES = "Only one reference per ID space allowed"
 
 
     def __init__(self, group="unknown", dataset="unknown", config=None):
@@ -197,7 +231,7 @@ class Report(object):
 
         self.n_lines += 1
         if result.skipped:
-            logging.info("SKIPPING (assocparser): {}".format(result.parsed_line))
+            logger.debug("SKIPPING (assocparser): {}".format(result.parsed_line))
             self.skipped += 1
         else:
             self.add_associations(result.associations)
@@ -273,7 +307,11 @@ class ParseResult:
     report: Optional[Report] = None
     evidence_used: List[str] = None
 
+
 # TODO avoid using names that are builtin python: file, id
+
+parser_version_regex = re.compile(r"!([\w]+)-version:[\s]*([\d]+\.[\d]+(\.[\d]+)?)")
+
 
 class AssocParser(object):
     """
@@ -322,7 +360,7 @@ class AssocParser(object):
                 if not skipheader or "header" not in association:
                     yield association
 
-        logging.info(self.report.short_summary())
+        logger.info(self.report.short_summary())
         file.close()
 
     def generate_associations(self, line, outfile=None):
@@ -357,7 +395,7 @@ class AssocParser(object):
 
         """
         if subset is not None:
-            logging.info("Creating mapping for subset: {}".format(subset))
+            logger.info("Creating mapping for subset: {}".format(subset))
             class_map = ontology.create_slim_mapping(subset=subset, relations=relations)
 
         if class_map is None:
@@ -369,7 +407,7 @@ class AssocParser(object):
             if line.startswith("!"):
                 continue
             vals = line.split("\t")
-            logging.info("LINE: {} VALS: {}".format(line, vals))
+            logger.debug("LINE: {} VALS: {}".format(line, vals))
             if len(vals) < col:
                 raise ValueError("Line: {} has too few cols, expect class id in col {}".format(line, col))
             cid = vals[col]
@@ -500,27 +538,6 @@ class AssocParser(object):
 
         return id
 
-    def _normalize_gaf_date(self, date, line: SplitLine):
-        if date is None or date == "":
-            self.report.warning(line.line, Report.INVALID_DATE, date, "GORULE:0000001: empty",
-                taxon=line.taxon, rule=1)
-            return date
-
-        # We check int(date)
-        if len(date) == 8 and date.isdigit():
-            d = datetime.datetime(int(date[0:4]), int(date[4:6]), int(date[6:8]), 0, 0, 0, 0)
-        else:
-            self.report.warning(line.line, Report.INVALID_DATE, date, "GORULE:0000001: Date field must be YYYYMMDD, got: {}".format(date),
-                taxon=line.taxon, rule=1)
-            try:
-                d = dateutil.parser.parse(date)
-            except:
-                self.report.error(line.line, Report.INVALID_DATE, date, "GORULE:0000001: Could not parse date '{}' at all".format(date),
-                    taxon=line.taxon, rule=1)
-                return None
-
-        return d.strftime("%Y%m%d")
-
     def _validate_symbol(self, symbol, line: SplitLine):
         if symbol is None or symbol == "":
             self.report.warning(line.line, Report.INVALID_SYMBOL, symbol, "GORULE:0000027: symbol is empty",
@@ -607,7 +624,7 @@ class AssocParser(object):
             return None
 
     def _ensure_file(self, file):
-        logging.info("Ensure file: {}".format(file))
+        logger.info("Ensure file: {}".format(file))
         if isinstance(file,str):
             # TODO Let's fix this if/elseif chain.
             if file.startswith("ftp"):
@@ -619,10 +636,10 @@ class AssocParser(object):
             elif file.startswith("http"):
                 url = file
                 with closing(requests.get(url, stream=False, headers={'User-Agent': get_user_agent(modules=[requests], caller_name=__name__)})) as resp:
-                    logging.info("URL: {} STATUS: {} ".format(url, resp.status_code))
+                    logger.info("URL: {} STATUS: {} ".format(url, resp.status_code))
                     ok = resp.status_code == 200
                     if ok:
-                        logging.debug("HEADER: {}".format(resp.headers))
+                        logger.debug("HEADER: {}".format(resp.headers))
                         if file.endswith(".gz"):
                             return io.StringIO(str(gzip.decompress(resp.content),'utf-8'))
                         else:
@@ -631,7 +648,7 @@ class AssocParser(object):
                     else:
                         return None
             else:
-                logging.info("Testing suffix of {}".format(file))
+                logger.info("Testing suffix of {}".format(file))
                 if file.endswith(".gz"):
                     return gzip.open(file, "rt")
                 else:
@@ -679,6 +696,29 @@ class AssocParser(object):
         else:
             self.report.error(line.line, Report.EXTENSION_SYNTAX_ERROR, x, msg="GORULE:0000027: ID not valid", rule=27)
             return None
+
+
+
+def _normalize_gaf_date(date, report, taxon, line):
+    if date is None or date == "":
+        report.warning(line, Report.INVALID_DATE, date, "GORULE:0000001: empty",
+            taxon=taxon, rule=1)
+        return date
+
+    # We check int(date)
+    if len(date) == 8 and date.isdigit():
+        d = datetime.datetime(int(date[0:4]), int(date[4:6]), int(date[6:8]), 0, 0, 0, 0)
+    else:
+        report.warning(line, Report.INVALID_DATE, date, "GORULE:0000001: Date field must be YYYYMMDD, got: {}".format(date),
+            taxon=taxon, rule=1)
+        try:
+            d = dateutil.parser.parse(date)
+        except:
+            report.error(line, Report.INVALID_DATE, date, "GORULE:0000001: Could not parse date '{}' at all".format(date),
+                taxon=taxon, rule=1)
+            return None
+
+    return d.strftime("%Y%m%d")
 
 ## we generate both qualifier and relation field
 ## Returns: (negated, relation, other_qualifiers)

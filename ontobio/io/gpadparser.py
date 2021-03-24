@@ -13,6 +13,9 @@ from typing import List, Dict
 import re
 import logging
 
+logger = logging.getLogger(__name__)
+
+
 class GpadParser(assocparser.AssocParser):
     """
     Parser for GO GPAD Format
@@ -54,7 +57,7 @@ class GpadParser(assocparser.AssocParser):
                 continue
             vals = line.split("\t")
             if len(vals) != 12:
-                logging.error("Unexpected number of columns: {}. GPAD should have 12.".format(vals))
+                logger.error("Unexpected number of columns: {}. GPAD should have 12.".format(vals))
             rel = vals[2]
 
             negated, relation, _ = self._parse_qualifier(vals[2], None)
@@ -148,8 +151,6 @@ class GpadParser(assocparser.AssocParser):
         if valid_goid == None:
             return assocparser.ParseResult(line, [], True)
         goid = valid_goid
-
-        date = self._normalize_gaf_date(date, split_line)
 
         if reference == "":
             self.report.error(line, Report.INVALID_ID, "EMPTY", "reference column 6 is empty")
@@ -298,7 +299,7 @@ def to_association(gpad_line: List[str], report=None, group="unknown", dataset="
     object = association.Term(gpad_line[3], "")
     evidence = association.Evidence(gpad_line[5],
         [e for e in gpad_line[4].split("|") if e],
-        [e for e in gpad_line[6].split("|") if e])
+        association.ConjunctiveSet.str_to_conjunctions(gpad_line[6]))
 
     raw_qs = gpad_line[2].split("|")
     negated = "NOT" in raw_qs
@@ -307,26 +308,21 @@ def to_association(gpad_line: List[str], report=None, group="unknown", dataset="
         report.error(source_line, Report.INVALID_QUALIFIER, raw_qs, "Could not find a URI for qualifier", taxon=taxon, rule=1)
         return assocparser.ParseResult(source_line, [], True, report=report)
 
+    date = assocparser._normalize_gaf_date(gpad_line[8], report, "", source_line)
+    if date is None:
+        return assocparser.ParseResult(source_line, [], True, report=report)
 
     qualifiers = [curie_util.contract_uri(q)[0] for q in looked_up_qualifiers]
 
     conjunctions = []
-    if gpad_line[11]:
-        for conjuncts in gpad_line[11].split("|"):
-            extension_units = []
-            for u in conjuncts.split(","):
-                parsed = relation_tuple.findall(u)
-                if len(parsed) == 1:
-                    rel, term = parsed[0]
-                    extension_units.append(association.ExtensionUnit(rel, term))
-                else:
-                    # Otherwise, something went bad with the regex, and it's a bad parse
-                    report.error(source_line, Report.EXTENSION_SYNTAX_ERROR, u, "extensions should be relation(curie)", taxon=taxon, rule=1)
-                    return assocparser.ParseResult(source_line, [], True, report=report)
+    if gpad_line[10]:
+        conjunctions = association.ConjunctiveSet.str_to_conjunctions(
+            gpad_line[10],
+            conjunct_element_builder=lambda el: association.ExtensionUnit.from_str(el))
 
-            conjunction = association.ExtensionConjunctions(extension_units)
-            conjunctions.append(conjunction)
-    object_extensions = association.ExtensionExpression(conjunctions)
+        if isinstance(conjunctions, association.Error):
+            report.error(source_line, Report.EXTENSION_SYNTAX_ERROR, conjunctions.info, "extensions should be relation(curie)", taxon=taxon, rule=1)
+            return assocparser.ParseResult(source_line, [], True, report=report)
 
     properties_list = [prop.split("=") for prop in gpad_line[11].split("|") if prop]
     # print(properties_list)
@@ -341,7 +337,7 @@ def to_association(gpad_line: List[str], report=None, group="unknown", dataset="
         interacting_taxon=gpad_line[7],
         evidence=evidence,
         subject_extensions=[],
-        object_extensions=object_extensions,
+        object_extensions=conjunctions,
         provided_by=gpad_line[9],
         date=gpad_line[8],
         properties={ prop[0]: prop[1] for prop in properties_list if prop })

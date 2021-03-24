@@ -3,6 +3,9 @@ import yaml
 import os
 from marshmallow import Schema, fields, pprint, post_load
 
+logger = logging.getLogger(__name__)
+
+
 class OntologyConfigSchema(Schema):
     """
     Set of ontologies
@@ -19,7 +22,7 @@ class EndpointSchema(Schema):
     """
     Configuration for a REST or RESTish endpoint
     """
-    url = fields.Url()
+    url = fields.Url(require_tld=False)
     timeout = fields.Int()
 
     @post_load
@@ -202,20 +205,20 @@ def get_config():
     if session.config is None:
         path = session.default_config_path
         if os.path.isfile(path):
-            logging.info("LOADING FROM: {}".format(path))
+            logger.info("LOADING FROM: {}".format(path))
             session.config = load_config(path)
         else:
             session.config = Config()
-            logging.info("using default session: {}, path does not exist: {}".format(session, path))
+            logger.info("using default session: {}, path does not exist: {}".format(session, path))
     else:
-        logging.info("Using pre-loaded object: {}".format(session.config))
+        logger.info("Using pre-loaded object: {}".format(session.config))
     return session.config
 
 def set_config(path):
     """
     Set configuration for current session.
     """
-    logging.info("LOADING FROM: {}".format(path))
+    logger.info("LOADING FROM: {}".format(path))
     session.config = load_config(path)
     return session.config
 
@@ -229,10 +232,11 @@ def load_config(path):
     f = open(path,'r')
     obj = yaml.load(f, Loader=yaml.FullLoader)
     schema = ConfigSchema()
-    config = schema.load(obj).data
-    errs = schema.validate(obj)
-    if len(errs) > 0:
-        logging.error("CONFIG ERRS: {}".format(errs))
-        raise ValueError('Error loading '+path)
-    #config = Config()
+    try:
+        config = schema.load(obj)
+    except ValidationError as err:
+        errors = err.messages
+        logger.error("CONFIG ERRS: {}".format(errors))
+        raise ValueError('Error loading ' + path)
+        
     return config

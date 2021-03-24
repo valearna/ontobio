@@ -3,6 +3,9 @@ import enum
 import collections
 import datetime
 import copy
+import logging
+
+from dataclasses import dataclass
 
 from typing import List, Dict, Any, Tuple, Union
 from ontobio import ontol
@@ -10,6 +13,9 @@ from ontobio import ecomap
 from ontobio.io import assocparser
 from ontobio.io import gaference
 from ontobio.model import association
+from ontobio.rdfgen import relations
+
+logger = logging.getLogger(__name__)
 
 FailMode = enum.Enum("FailMode", {"SOFT": "soft", "HARD": "hard"})
 ResultType = enum.Enum("Result", {"PASS": "Pass", "WARNING": "Warning", "ERROR": "Error"})
@@ -49,10 +55,11 @@ def repair_result(repair_state: RepairState, fail_mode: FailMode) -> ResultType:
 
 class GoRule(object):
 
-    def __init__(self, id, title, fail_mode: FailMode):
+    def __init__(self, id, title, fail_mode: FailMode, tags=[]):
         self.id = id
         self.title = title
         self.fail_mode = fail_mode
+        self.run_context_tags = set(tags)
 
     def _list_terms(self, pipe_separated):
         terms = pipe_separated.split("|")
@@ -62,18 +69,33 @@ class GoRule(object):
     def _result(self, passes: bool) -> TestResult:
         return TestResult(result(passes, self.fail_mode), self.title, passes)
 
+    def _is_run_from_context(self, config: assocparser.AssocParserConfig) -> bool:
+        rule_tags_to_match = set([ "context-{}".format(c) for c in config.rule_contexts ])
+        # If there is no context, then run
+        # Or, if any run_context_tags is in rule_tags_to_match, then run
+        return len(self.run_context_tags) == 0 or any(self.run_context_tags & rule_tags_to_match)
+
+    def _run_if_context(self, annotation: association.GoAssociation, config: assocparser.AssocParserConfig, group=None) -> TestResult:
+        result = TestResult(ResultType.PASS, "", annotation)
+        if self._is_run_from_context(config):
+            result = self.test(annotation, config, group=group)
+
+        return result
+
     def run_test(self, annotation: association.GoAssociation, config: assocparser.AssocParserConfig, group=None) -> TestResult:
-        result = self.test(annotation, config, group=group)
+        result = self._run_if_context(annotation, config, group=group)
         result.result = annotation
         return result
 
+
     def test(self, annotation: association.GoAssociation, config: assocparser.AssocParserConfig, group=None) -> TestResult:
+        # run_test() -> _run_if_context() -> test()
         pass
 
 class RepairRule(GoRule):
 
-    def __init__(self, id, title, fail_mode):
-        super().__init__(id, title, fail_mode)
+    def __init__(self, id, title, fail_mode, tags=[]):
+        super().__init__(id, title, fail_mode, tags)
 
     def message(self, state: RepairState) -> str:
         message = ""
@@ -85,7 +107,8 @@ class RepairRule(GoRule):
         return message
 
     def run_test(self, annotation: association.GoAssociation, config: assocparser.AssocParserConfig, group=None) -> TestResult:
-        return self.test(annotation, config, group=group)
+        result = self._run_if_context(annotation, config, group=group)
+        return result
 
     def repair(self, annotation: association.GoAssociation, group=None) -> Tuple[List, RepairState]:
         pass
@@ -190,21 +213,34 @@ class GoRule11(GoRule):
 class GoRule13(GoRule):
 
     def __init__(self):
-        super().__init__("GORULE:0000013", "Taxon-appropriate annotation check", FailMode.SOFT)
+        super().__init__("GORULE:0000013", "Taxon-appropriate annotation check", FailMode.HARD)
+        self.non_experimental_evidence = set(["ECO:0000318", "ECO:0000320", "ECO:0000321", "ECO:0000305", "ECO:0000247", "ECO:0000255", "ECO:0000266", "ECO:0000250", "ECO:0000303", "ECO:0000245", "ECO:0000304", "ECO:0000307", "ECO:0000501"])
 
     def test(self, annotation: association.GoAssociation, config: assocparser.AssocParserConfig, group=None) -> TestResult:
         if config.annotation_inferences is None:
             # Auto pass if we don't have inferences
             return self._result(True)
 
-        inference_results = gaference.produce_inferences(annotation, config.annotation_inferences) #type: List[gaference.InferenceResult]
+        if annotation.negated:
+            # The rule is passed if the annotation is negated
+            return self._result(True)
+
+        inference_results = gaference.produce_inferences(annotation, config.annotation_inferences)  # type: List[gaference.InferenceResult]
         taxon_passing = True
         for result in inference_results:
             if result.problem == gaference.ProblemType.TAXON:
                 taxon_passing = False
                 break
 
-        return self._result(taxon_passing)
+        if taxon_passing:
+            return self._result(True)
+        else:
+            # Filter non experimental evidence
+            if annotation.evidence.type in self.non_experimental_evidence:
+                return self._result(False)
+            else:
+                # Only submit a warning/report if we are an experimental evidence
+                return TestResult(ResultType.WARNING, self.title, False)
 
 class GoRule15(GoRule):
 
@@ -217,8 +253,9 @@ class GoRule15(GoRule):
         # Cache the allowed terms
         if self.allowed_dual_species_terms is None and config.ontology is not None:
             interaction_terms = config.ontology.descendants("GO:0044419", relations=["subClassOf"], reflexive=True)
-            other_organism_terms = config.ontology.descendants("GO:0044215", relations=["subClassOf"], reflexive=True)
-            self.allowed_dual_species_terms = set(interaction_terms + other_organism_terms)
+            interspecies_interactions_regulation = config.ontology.descendants("GO:0043903", relations=["subClassOf"], reflexive=True)
+            host_cellular_component = config.ontology.descendants("GO:0018995", relations=["subClassOf"], reflexive=True)
+            self.allowed_dual_species_terms = set(interaction_terms + interspecies_interactions_regulation + host_cellular_component)
         elif config.ontology is None:
             return self._result(True)
 
@@ -246,7 +283,7 @@ class GoRule16(GoRule):
 
         okay = True
         if evidence == "ECO:0000305":
-            only_go = [t for t in withfrom if t.startswith("GO:")] # Filter terms that aren't GO terms
+            only_go = [t for conjunctions in withfrom for t in conjunctions.elements if t.startswith("GO:")] # Filter terms that aren't GO terms
             okay = len(only_go) >= 1
 
         return self._result(okay)
@@ -335,8 +372,9 @@ class GoRule28(RepairRule):
 class GoRule29(GoRule):
 
     def __init__(self):
-        super().__init__("GORULE:0000029", "All IEAs over a year old are removed", FailMode.HARD)
+        super().__init__("GORULE:0000029", "All IEAs over a year are warned, all IEAs over two are removed", FailMode.HARD)
         self.one_year = datetime.timedelta(days=365)
+        self.two_years = datetime.timedelta(days=730)
 
     def test(self, annotation: association.GoAssociation, config: assocparser.AssocParserConfig, group=None) -> TestResult:
         evidence = annotation.evidence.type
@@ -344,19 +382,27 @@ class GoRule29(GoRule):
 
         now = datetime.datetime.today()
 
-        time_compare_delta = self.one_year
-        if group is not None and group == "ecocyc":
-            time_compare_delta = datetime.timedelta(days=2*365)
+        time_compare_delta_short = self.one_year
+        time_compare_delta_long = self.two_years
+        time_diff = now - datetime.datetime(int(date[0:4]),
+                                            int(date[4:6]),
+                                            int(date[6:8]),
+                                            0, 0, 0, 0)
 
         iea = "ECO:0000501"
-        fails = (evidence == iea and now - datetime.datetime(int(date[0:4]), int(date[4:6]), int(date[6:8]), 0, 0, 0, 0) > time_compare_delta)
-        return self._result(not fails)
+        if evidence == iea:
+            if time_diff > time_compare_delta_long:
+                return self._result(False)
+            elif time_diff > time_compare_delta_short:
+                return TestResult(ResultType.WARNING, self.title, annotation)
 
+        ## Default results we we get here.
+        return self._result(True)
 
 class GoRule30(GoRule):
 
     def __init__(self):
-        super().__init__("GORULE:0000030", "Deprecated GO_REFs are not allowed", FailMode.HARD)
+        super().__init__("GORULE:0000030", "Deprecated GO_REFs are not allowed", FailMode.SOFT)
 
     def _ref_curi_to_id(self, goref) -> str:
         """
@@ -474,7 +520,11 @@ class GoRule46(GoRule):
 
         if goterm in self.self_binding_terms:
             # Then we're in the self-binding case, and check if object ID is in withfrom
-            return self._result(annotation.subject.id in withfroms)
+            for conj in withfroms:
+                if annotation.subject.id in conj.elements:
+                    return self._result(True)
+
+            return self._result(False)
 
         return self._result(True)
 
@@ -490,9 +540,131 @@ class GoRule50(GoRule):
         result = self._result(True)
         if evidence in self.the_evidences:
             # Ensure the gp ID is not an entry in withfrom
-            result = self._result(annotation.subject.id not in annotation.evidence.with_support_from)
+            for conj in annotation.evidence.with_support_from:
+                result = self._result(annotation.subject.id not in conj.elements)
 
         return result
+
+class GoRule55(GoRule):
+
+    def __init__(self):
+        super().__init__("GORULE:0000055", "References should have only one ID per ID space", FailMode.SOFT)
+
+    def test(self, annotation: association.GoAssociation, config: assocparser.AssocParserConfig, group=None) -> TestResult:
+        found_id_spaces = dict()
+        for ref in annotation.evidence.has_supporting_reference:
+            id_space = ref.split(":", maxsplit=1)[0]
+            if id_space in found_id_spaces:
+                return self._result(False)
+            else:
+                found_id_spaces[id_space] = ref
+        # We found no duplicate IDs, so we good
+        return self._result(True)
+
+
+class GoRule57(GoRule):
+
+    def __init__(self):
+        super().__init__("GORULE:0000057", "Group specific filter rules should be applied to annotations", FailMode.HARD, tags=["context-import"])
+
+    def test(self, annotation: association.GoAssociation, config: assocparser.AssocParserConfig, group=None) -> TestResult:
+        # Check group_metadata is present
+        if config.group_metadata is None:
+            return self._result(True)
+
+        evidence_codes = config.group_metadata.get("filter_out", {}).get("evidence", [])
+        if annotation.evidence.type in evidence_codes:
+            return self._result(False)
+
+        evidences_references = config.group_metadata.get("filter_out", {}).get("evidence_reference", [])
+        for er in evidences_references:
+            evidence_code = er["evidence"]
+            reference = er["reference"]
+            if annotation.evidence.type == evidence_code and annotation.evidence.has_supporting_reference == reference:
+                return self._result(False)
+
+        properties = config.group_metadata.get("filter_out", {}).get("annotation_properties", [])
+        for p in properties:
+            if p in annotation.properties.keys():
+                return self._result(False)
+
+        return self._result(True)
+
+class GoRule58(RepairRule):
+
+    def __init__(self):
+        super().__init__("GORULE:0000058", "Object extensions should conform to the extensions-patterns.yaml file in metadata", FailMode.HARD, tags=["context-import"])
+
+    def test(self, annotation: association.GoAssociation, config: assocparser.AssocParserConfig, group=None) -> TestResult:
+
+        if config.extensions_constraints is None:
+            return TestResult(ResultType.PASS, self.title, annotation)
+
+        if config.ontology is None:
+            return TestResult(ResultType.PASS, self.title, annotation)
+
+        repair_state = RepairState.OKAY
+
+        bad_conjunctions = []
+        for con in annotation.object_extensions:
+            # Count each extension unit, represented by tuple (Relation, Namespace)
+            extension_counts = collections.Counter([(unit.relation, unit.term.split(":")[0]) for unit in con.elements])
+
+            matches = self._do_conjunctions_match_constraint(con, annotation.object.id, config.extensions_constraints, extension_counts)
+            # If there is a match in the constraints, then we're all good and we can exit with a pass!
+            if not matches:
+                bad_conjunctions.append(con)
+                repair_state = RepairState.REPAIRED
+
+        repaired_annotation = copy.deepcopy(annotation)
+        for con in bad_conjunctions:
+            # Remove the bad conjunctions as the "repair"
+            repaired_annotation.object_extensions.remove(con)
+
+        return TestResult(repair_result(repair_state, self.fail_mode), self.message(repair_state), repaired_annotation)
+
+    """
+    This matches a conjunction against the extension constraints passed in through `extensions-constraints.yaml` in go-site.
+    The extensions constraints acts as a white list, and as such each extension unit in the conjunction must
+    find a match in the constraints list: the extension relation must match a constraint, and if it does, the
+    namespace of the extension filler must much an allowed namespace in the constraint, the annotation GO term
+    must match one of the classes in 'primary_terms', and possibly a cardinality of (Relation, Namespace) must
+    not be violated.
+
+    If such a match is found, then we can move to the next extension unit in the conjunction list. If each extension has
+    a match in the constraints then the conjunction passes the test.
+
+    Any extension unit that fails means the entire conjunction fails.
+    """
+    def _do_conjunctions_match_constraint(self, conjunction, term, constraints, conjunction_counts):
+        # Check each extension in the conjunctions
+        for ext in conjunction.elements:
+
+            extension_good = False
+            for constraint in constraints:
+
+                if ext.relation == constraint["relation"]:
+
+                    if (ext.term.split(":")[0] in constraint["namespaces"] and term in constraint["primary_terms"]):
+                        # If we match namespace and go term, then if we there is a cardinality constraint, check that.
+                        if "cardinality" in constraint:
+                            cardinality_violations = [(ext, num) for ext, num in dict(conjunction_counts).items() if num > constraint["cardinality"]]
+                            extension_good = len(cardinality_violations) == 0
+                        else:
+                            extension_good = True
+
+                        if extension_good:
+                            # If things are good for this extension, break and go to the next one
+                            break
+
+            # if we get through all constraints and we found no constraint match for `ext`
+            # Then we know that `ext` is wrong, making the whole conjunction wrong, and we can bail here.
+            if not extension_good:
+                return False
+
+        # If we get to the end of all extensions without failing early, then the conjunction is good!
+        return True
+
 
 GoRules = enum.Enum("GoRules", {
     "GoRule02": GoRule02(),
@@ -514,9 +686,13 @@ GoRules = enum.Enum("GoRules", {
     "GoRule43": GoRule43(),
     "GoRule46": GoRule46(),
     "GoRule50": GoRule50(),
+    "GoRule55": GoRule55(),
+    "GoRule57": GoRule57(),
+    "GoRule58": GoRule58(),
     # GoRule13 at the bottom in order to make all other rules clean up an annotation before reaching 13
     "GoRule13": GoRule13()
 })
+
 
 GoRulesResults = collections.namedtuple("GoRulesResults", ["all_results", "annotation"])
 def test_go_rules(annotation: association.GoAssociation, config: assocparser.AssocParserConfig, group=None) -> GoRulesResults:

@@ -1,4 +1,3 @@
-!gaf-version: 2.1
 !Project_name: Fake
 MGI	MGI:88276	Ctnnb1	acts_upstream_of	GO:1904948	MGI:MGI:3836885|PMID:19122665	IMP		P	catenin (cadherin associated protein), beta 1	beta catenin|beta-catenin|Catnb	protein	taxon:10090	20160209	ParkinsonsUK-UCL	occurs_in(EMAPA:16975)
 MGI	SPCC736.14	dis1	colocalizes_with	GO:0035371	PAINT_REF:12609	IMP	PANTHER:PTN000288762	C	TOG/XMAP14 microtubule-associated protein Dis1	UniProtKB:Q09933|PTN000288823	protein	NCBITaxon:4896	20161005	GO_Central

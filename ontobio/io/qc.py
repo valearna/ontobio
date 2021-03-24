@@ -676,7 +676,7 @@ GoRules = enum.Enum("GoRules", {
     "GoRule16": GoRule16(),
     "GoRule17": GoRule17(),
     "GoRule18": GoRule18(),
-    "GoRule26": GoRule26(),
+    #"GoRule26": GoRule26(),
     "GoRule28": GoRule28(),
     "GoRule29": GoRule29(),
     "GoRule30": GoRule30(),
